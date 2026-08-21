@@ -12,7 +12,7 @@ var ErrInsufficientBalance = errors.New("insufficient balance")
 
 // Entry is one leg of a double-entry transaction.
 type Entry struct {
-	AccountID string
+	AccountID   string
 	AmountCents int64 // positive = credit, negative = debit
 }
 
