@@ -33,6 +33,16 @@ func (f *fakeRepo) SeenIdempotencyKey(_ context.Context, key string) (bool, erro
 	return f.seen[key], nil
 }
 
+type fakePublisher struct {
+	published []Transaction
+	err       error
+}
+
+func (f *fakePublisher) Publish(_ context.Context, tx Transaction) error {
+	f.published = append(f.published, tx)
+	return f.err
+}
+
 func TestPost_TableDriven(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -83,7 +93,8 @@ func TestPost_TableDriven(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := newFakeRepo()
 			repo.balances["alice"] = tc.startBal
-			svc := NewService(repo)
+			pub := &fakePublisher{}
+			svc := NewService(repo, pub)
 
 			err := svc.Post(context.Background(), tc.tx)
 
@@ -105,14 +116,42 @@ func TestPost_TableDriven(t *testing.T) {
 			if tc.wantApplied && len(repo.applied) != 1 {
 				t.Fatalf("expected transaction to be applied once, got %d", len(repo.applied))
 			}
+			if tc.wantApplied && len(pub.published) != 1 {
+				t.Fatalf("expected transaction to be published once, got %d", len(pub.published))
+			}
+			if !tc.wantApplied && len(pub.published) != 0 {
+				t.Fatalf("expected no publish for a rejected transaction, got %d", len(pub.published))
+			}
 		})
+	}
+}
+
+func TestPost_PublishFailureDoesNotFailPost(t *testing.T) {
+	repo := newFakeRepo()
+	repo.balances["alice"] = 1000
+	pub := &fakePublisher{err: errors.New("broker unreachable")}
+	svc := NewService(repo, pub)
+	tx := Transaction{
+		IdempotencyKey: "publish-fail-key",
+		Entries: []Entry{
+			{AccountID: "alice", AmountCents: -100},
+			{AccountID: "bob", AmountCents: 100},
+		},
+	}
+
+	if err := svc.Post(context.Background(), tx); err != nil {
+		t.Fatalf("Post should succeed even if publish fails (Postgres is the source of truth): %v", err)
+	}
+	if len(repo.applied) != 1 {
+		t.Fatalf("expected transaction to still be applied, got %d", len(repo.applied))
 	}
 }
 
 func TestPost_IdempotentRetry(t *testing.T) {
 	repo := newFakeRepo()
 	repo.balances["alice"] = 1000
-	svc := NewService(repo)
+	pub := &fakePublisher{}
+	svc := NewService(repo, pub)
 	tx := Transaction{
 		IdempotencyKey: "retry-key",
 		Entries: []Entry{
@@ -130,5 +169,8 @@ func TestPost_IdempotentRetry(t *testing.T) {
 
 	if got := repo.balances["alice"]; got != 900 {
 		t.Fatalf("balance double-applied: got %d, want 900", got)
+	}
+	if len(pub.published) != 1 {
+		t.Fatalf("expected publish exactly once despite the retry, got %d", len(pub.published))
 	}
 }

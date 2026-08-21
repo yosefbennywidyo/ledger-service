@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 )
 
 // ErrInsufficientBalance is returned when a debit would take an account below zero.
@@ -30,14 +31,23 @@ type Repository interface {
 	SeenIdempotencyKey(ctx context.Context, key string) (bool, error)
 }
 
-// Service is the ledger domain service.
-type Service struct {
-	repo Repository
+// EventPublisher is the async fan-out boundary the ledger service depends on
+// after a transaction is durably applied (e.g. fraud-check, notifications,
+// reconciliation). Implementations live in internal/kafka; tests can supply
+// an in-memory fake.
+type EventPublisher interface {
+	Publish(ctx context.Context, tx Transaction) error
 }
 
-// NewService wires a ledger Service to its Repository.
-func NewService(repo Repository) *Service {
-	return &Service{repo: repo}
+// Service is the ledger domain service.
+type Service struct {
+	repo      Repository
+	publisher EventPublisher
+}
+
+// NewService wires a ledger Service to its Repository and EventPublisher.
+func NewService(repo Repository, publisher EventPublisher) *Service {
+	return &Service{repo: repo, publisher: publisher}
 }
 
 // Post validates and applies a balanced transaction.
@@ -69,6 +79,13 @@ func (s *Service) Post(ctx context.Context, tx Transaction) error {
 
 	if err := s.repo.Apply(ctx, tx); err != nil {
 		return fmt.Errorf("apply transaction: %w", err)
+	}
+
+	// Postgres is the source of truth and already has the transaction — a
+	// publish failure here must not fail the API response, since Kafka is
+	// an async, out-of-the-critical-path fan-out.
+	if err := s.publisher.Publish(ctx, tx); err != nil {
+		log.Printf("publish transaction event for %s: %v", tx.IdempotencyKey, err)
 	}
 	return nil
 }

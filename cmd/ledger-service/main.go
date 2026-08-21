@@ -6,8 +6,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"ledger-rail/ledger-service/internal/httpapi"
+	"ledger-rail/ledger-service/internal/kafka"
 	"ledger-rail/ledger-service/internal/ledger"
 	"ledger-rail/ledger-service/internal/postgres"
 )
@@ -21,6 +23,14 @@ func main() {
 	if addr == "" {
 		addr = "8080"
 	}
+	brokers := os.Getenv("KAFKA_BROKERS")
+	if brokers == "" {
+		brokers = "localhost:9092"
+	}
+	topic := os.Getenv("KAFKA_TOPIC")
+	if topic == "" {
+		topic = "transactions"
+	}
 
 	store, err := postgres.Open(dsn)
 	if err != nil {
@@ -28,7 +38,10 @@ func main() {
 	}
 	defer store.Close()
 
-	svc := ledger.NewService(store)
+	producer := kafka.NewProducer(strings.Split(brokers, ","), topic)
+	defer producer.Close()
+
+	svc := ledger.NewService(store, producer)
 	server := httpapi.NewServer(svc)
 
 	log.Printf("ledger-service listening on :%s", addr)
