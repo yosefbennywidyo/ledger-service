@@ -70,6 +70,8 @@ func (r *Relay) drainOnce(ctx context.Context) {
 		}
 		if err := r.repo.MarkPublished(ctx, rec.ID); err != nil {
 			log.Printf("outbox: mark published %d: %v", rec.ID, err)
+			continue
 		}
+		log.Printf("outbox: published %s (row %d)", rec.Key, rec.ID)
 	}
 }

@@ -26,6 +26,17 @@ func NewProducer(brokers []string, topic string) *Producer {
 			// Default is 1s; the outbox relay writes one message per call, so
 			// a long batch timeout would cap relay throughput near 1 event/sec.
 			BatchTimeout: 10 * time.Millisecond,
+			// kafka-go's Writer defaults RequiredAcks to RequireNone
+			// (fire-and-forget) when constructed as a struct literal like
+			// this — the "defaults to RequireAll" behavior documented
+			// elsewhere only applies to the deprecated NewWriter(config)
+			// constructor, which this code doesn't use. Under RequireNone, a
+			// write can report success as soon as it's handed to a
+			// connection, even if the broker never actually persists it
+			// (e.g. it's mid-shutdown) — silently defeating the outbox's
+			// entire "event is not lost" guarantee. Require the full ISR to
+			// acknowledge before WriteMessages returns.
+			RequiredAcks: segmentio.RequireAll,
 		},
 	}
 }
