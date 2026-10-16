@@ -1,3 +1,4 @@
+// Package ledger implements double-entry balance logic for the core ledger.
 package ledger
 
 import (
@@ -11,11 +12,13 @@ var (
 	ErrConflict              = errors.New("idempotency key still processing")
 )
 
+// Entry is one leg of a double-entry transaction.
 type Entry struct {
 	AccountID   string
-	AmountCents int64
+	AmountCents int64 // positive = credit, negative = debit
 }
 
+// Transaction is a balanced set of entries — the sum of AmountCents must be zero.
 type Transaction struct {
 	IdempotencyKey string
 	Entries        []Entry

@@ -61,7 +61,10 @@ func (r *Relay) drainOnce(ctx context.Context) {
 		return
 	}
 	for _, rec := range records {
-		if err := r.publisher.PublishRaw(ctx, rec.Key, rec.Payload); err != nil {
+		publishCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := r.publisher.PublishRaw(publishCtx, rec.Key, rec.Payload)
+		cancel()
+		if err != nil {
 			log.Printf("outbox: publish %s: %v", rec.Key, err)
 			continue
 		}

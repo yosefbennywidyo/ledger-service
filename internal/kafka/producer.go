@@ -6,6 +6,7 @@ package kafka
 import (
 	"context"
 	"fmt"
+	"time"
 
 	segmentio "github.com/segmentio/kafka-go"
 )
@@ -22,6 +23,9 @@ func NewProducer(brokers []string, topic string) *Producer {
 			Addr:     segmentio.TCP(brokers...),
 			Topic:    topic,
 			Balancer: &segmentio.LeastBytes{},
+			// Default is 1s; the outbox relay writes one message per call, so
+			// a long batch timeout would cap relay throughput near 1 event/sec.
+			BatchTimeout: 10 * time.Millisecond,
 		},
 	}
 }

@@ -84,6 +84,9 @@ func (s *Store) inspectExistingClaim(ctx context.Context, key string, retriesLef
 
 	switch status {
 	case "completed":
+		if !respStatus.Valid {
+			return ledger.Claim{}, fmt.Errorf("completed idempotency row for key %s has no stored response", key)
+		}
 		return ledger.Claim{
 			State:          ledger.ClaimCompleted,
 			ResponseStatus: int(respStatus.Int64),
@@ -121,29 +124,45 @@ func (s *Store) inspectExistingClaim(ctx context.Context, key string, retriesLef
 // so lock order is consistent), checks balances for every debited account,
 // and persists either the entries plus outbox row (201) or only the
 // rejection (422) in a single ACID transaction.
-func (s *Store) ApplyLocked(ctx context.Context, tx ledger.Transaction) (int, []byte, error) {
+func (s *Store) ApplyLocked(ctx context.Context, tx ledger.Transaction) (status int, body []byte, err error) {
 	dbTx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, nil, fmt.Errorf("begin transaction: %w", err)
 	}
 	defer dbTx.Rollback() //nolint:errcheck // no-op if already committed
+	defer func() {
+		if err != nil {
+			// Best-effort: on any unexpected failure, expire this key's lease now
+			// instead of leaving a retry locked out for the rest of the 30s
+			// window. Use a context detached from the caller's (which may already
+			// be canceled — that's often why we're here) so this cleanup query
+			// isn't itself immediately canceled.
+			_, _ = s.db.ExecContext(context.WithoutCancel(ctx),
+				`UPDATE ledger_transactions SET claimed_at = now() - interval '31 seconds' WHERE idempotency_key = $1 AND status = 'processing'`,
+				tx.IdempotencyKey,
+			)
+		}
+	}()
 
 	// Lock this key's idempotency row for the rest of the transaction. This
 	// serializes competing holders (original claimant vs. reclaimer) and,
 	// if another holder already committed, returns its stored result
 	// instead of double-posting.
 	var (
-		status     string
+		rowStatus  string
 		respStatus sql.NullInt64
 		respBody   sql.NullString
 	)
 	if err := dbTx.QueryRowContext(ctx,
 		`SELECT status, response_status, response_body FROM ledger_transactions WHERE idempotency_key = $1 FOR UPDATE`,
 		tx.IdempotencyKey,
-	).Scan(&status, &respStatus, &respBody); err != nil {
+	).Scan(&rowStatus, &respStatus, &respBody); err != nil {
 		return 0, nil, fmt.Errorf("lock idempotency row: %w", err)
 	}
-	if status == "completed" {
+	if rowStatus == "completed" {
+		if !respStatus.Valid {
+			return 0, nil, fmt.Errorf("completed idempotency row for key %s has no stored response", tx.IdempotencyKey)
+		}
 		if err := dbTx.Commit(); err != nil {
 			return 0, nil, fmt.Errorf("commit transaction: %w", err)
 		}
@@ -218,7 +237,7 @@ func (s *Store) ApplyLocked(ctx context.Context, tx ledger.Transaction) (int, []
 		return 0, nil, fmt.Errorf("insert outbox row: %w", err)
 	}
 
-	body := []byte(`{"status":"completed"}`)
+	body = []byte(`{"status":"completed"}`)
 	if _, err := dbTx.ExecContext(ctx,
 		`UPDATE ledger_transactions SET status = 'completed', response_status = 201, response_body = $2 WHERE idempotency_key = $1`,
 		tx.IdempotencyKey, string(body),
