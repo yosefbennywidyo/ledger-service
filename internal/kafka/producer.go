@@ -1,5 +1,6 @@
-// Package kafka implements ledger.EventPublisher against Kafka/Redpanda —
-// the async fan-out consumed by fraud-check (see e2e/PLAN.md jalur E-F).
+// Package kafka publishes encoded ledger events to Kafka/Redpanda — the async
+// fan-out consumed by fraud-check (see e2e/PLAN.md jalur E-F). The outbox relay
+// drives it via PublishRaw, which satisfies outbox.Publisher.
 package kafka
 
 import (
@@ -9,7 +10,7 @@ import (
 	segmentio "github.com/segmentio/kafka-go"
 )
 
-// Producer is a ledger.EventPublisher backed by Kafka/Redpanda.
+// Producer publishes encoded events to Kafka/Redpanda for the outbox relay.
 type Producer struct {
 	writer *segmentio.Writer
 }

@@ -4,6 +4,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"ledger-rail/ledger-service/internal/ledger"
@@ -51,10 +52,19 @@ func (s *Server) handlePostTransaction(w http.ResponseWriter, r *http.Request) {
 		tx.Entries = append(tx.Entries, ledger.Entry{AccountID: e.AccountID, AmountCents: e.AmountCents})
 	}
 
-	if err := s.svc.Post(r.Context(), tx); err != nil {
-		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+	status, body, err := s.svc.Post(r.Context(), tx)
+	if err != nil {
+		switch {
+		case errors.Is(err, ledger.ErrUnbalancedTransaction):
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		case errors.Is(err, ledger.ErrConflict):
+			http.Error(w, err.Error(), http.StatusConflict)
+		default:
+			http.Error(w, "internal error", http.StatusInternalServerError)
+		}
 		return
 	}
-
-	w.WriteHeader(http.StatusCreated)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	w.Write(body)
 }
