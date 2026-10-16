@@ -128,6 +128,28 @@ func (s *Store) ApplyLocked(ctx context.Context, tx ledger.Transaction) (int, []
 	}
 	defer dbTx.Rollback() //nolint:errcheck // no-op if already committed
 
+	// Lock this key's idempotency row for the rest of the transaction. This
+	// serializes competing holders (original claimant vs. reclaimer) and,
+	// if another holder already committed, returns its stored result
+	// instead of double-posting.
+	var (
+		status     string
+		respStatus sql.NullInt64
+		respBody   sql.NullString
+	)
+	if err := dbTx.QueryRowContext(ctx,
+		`SELECT status, response_status, response_body FROM ledger_transactions WHERE idempotency_key = $1 FOR UPDATE`,
+		tx.IdempotencyKey,
+	).Scan(&status, &respStatus, &respBody); err != nil {
+		return 0, nil, fmt.Errorf("lock idempotency row: %w", err)
+	}
+	if status == "completed" {
+		if err := dbTx.Commit(); err != nil {
+			return 0, nil, fmt.Errorf("commit transaction: %w", err)
+		}
+		return int(respStatus.Int64), []byte(respBody.String), nil
+	}
+
 	// Net delta per account, so a debited account touched by several entries
 	// is checked against its total.
 	net := make(map[string]int64)
