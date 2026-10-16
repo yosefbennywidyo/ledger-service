@@ -134,9 +134,13 @@ func (s *Store) ApplyLocked(ctx context.Context, tx ledger.Transaction) (status 
 		if err != nil {
 			// Best-effort: on any unexpected failure, expire this key's lease now
 			// instead of leaving a retry locked out for the rest of the 30s
-			// window. Use a context detached from the caller's (which may already
-			// be canceled — that's often why we're here) so this cleanup query
-			// isn't itself immediately canceled.
+			// window. Roll back first — this transaction may still be holding
+			// the row lock on the very row this UPDATE needs, and the outer
+			// `defer dbTx.Rollback()` wouldn't run until after this closure
+			// returns. Use a context detached from the caller's (which may
+			// already be canceled — that's often why we're here) so this
+			// cleanup query isn't itself immediately canceled.
+			_ = dbTx.Rollback()
 			_, _ = s.db.ExecContext(context.WithoutCancel(ctx),
 				`UPDATE ledger_transactions SET claimed_at = now() - interval '31 seconds' WHERE idempotency_key = $1 AND status = 'processing'`,
 				tx.IdempotencyKey,
