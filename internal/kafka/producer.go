@@ -4,12 +4,9 @@ package kafka
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	segmentio "github.com/segmentio/kafka-go"
-
-	"ledger-rail/ledger-service/internal/ledger"
 )
 
 // Producer is a ledger.EventPublisher backed by Kafka/Redpanda.
@@ -32,36 +29,16 @@ func (p *Producer) Close() error {
 	return p.writer.Close()
 }
 
-// transactionEvent is the wire format fraud-check's consumer expects
-// (see fraud-check/src/fraud_check/consumer.py).
-type transactionEvent struct {
-	IdempotencyKey string      `json:"idempotency_key"`
-	Entries        []entryJSON `json:"entries"`
-}
-
-type entryJSON struct {
-	AccountID   string `json:"account_id"`
-	AmountCents int64  `json:"amount_cents"`
-}
-
-// Publish sends tx as a JSON event keyed by its idempotency key, so all
-// entries of one transaction land on the same partition and stay ordered.
-func (p *Producer) Publish(ctx context.Context, tx ledger.Transaction) error {
-	event := transactionEvent{IdempotencyKey: tx.IdempotencyKey}
-	for _, e := range tx.Entries {
-		event.Entries = append(event.Entries, entryJSON{AccountID: e.AccountID, AmountCents: e.AmountCents})
-	}
-
-	payload, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("marshal transaction event: %w", err)
-	}
-
+// PublishRaw sends an already-encoded event payload to Kafka under key, so
+// all entries of one transaction stay on the same partition and in order.
+// Used by the outbox relay, which reads already-marshaled payloads from the
+// outbox table rather than re-encoding a ledger.Transaction.
+func (p *Producer) PublishRaw(ctx context.Context, key string, payload []byte) error {
 	if err := p.writer.WriteMessages(ctx, segmentio.Message{
-		Key:   []byte(tx.IdempotencyKey),
+		Key:   []byte(key),
 		Value: payload,
 	}); err != nil {
-		return fmt.Errorf("publish transaction event: %w", err)
+		return fmt.Errorf("publish event: %w", err)
 	}
 	return nil
 }
