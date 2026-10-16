@@ -1,93 +1,83 @@
-// Package ledger implements double-entry balance logic for the core ledger.
 package ledger
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 )
 
-// ErrInsufficientBalance is returned when a debit would take an account below zero.
-var ErrInsufficientBalance = errors.New("insufficient balance")
+var (
+	ErrUnbalancedTransaction = errors.New("unbalanced transaction")
+	ErrConflict              = errors.New("idempotency key still processing")
+)
 
-// Entry is one leg of a double-entry transaction.
 type Entry struct {
 	AccountID   string
-	AmountCents int64 // positive = credit, negative = debit
+	AmountCents int64
 }
 
-// Transaction is a balanced set of entries — the sum of AmountCents must be zero.
 type Transaction struct {
 	IdempotencyKey string
 	Entries        []Entry
 }
 
+type ClaimState int
+
+const (
+	ClaimAcquired ClaimState = iota
+	ClaimCompleted
+	ClaimProcessing
+)
+
+// Claim is the outcome of attempting to claim an idempotency key.
+// ResponseStatus/ResponseBody are only populated when State is ClaimCompleted.
+type Claim struct {
+	State          ClaimState
+	ResponseStatus int
+	ResponseBody   []byte
+}
+
 // Repository is the persistence boundary the ledger service depends on.
-// Implementations live in internal/postgres; tests can supply an in-memory fake.
 type Repository interface {
-	Balance(ctx context.Context, accountID string) (int64, error)
-	Apply(ctx context.Context, tx Transaction) error
-	SeenIdempotencyKey(ctx context.Context, key string) (bool, error)
+	// ClaimIdempotencyKey atomically claims key for processing, or reports
+	// that it's already completed (with the stored response to replay) or
+	// still genuinely in flight.
+	ClaimIdempotencyKey(ctx context.Context, key string) (Claim, error)
+	// ApplyLocked locks every account tx touches, checks balances, and
+	// atomically persists the outcome — writing ledger_entries and an
+	// outbox row on success, or just the rejection on insufficient balance.
+	// A business rejection is returned as (422, body, nil), never as err;
+	// err is reserved for unexpected failures (e.g. the database is down).
+	ApplyLocked(ctx context.Context, tx Transaction) (status int, body []byte, err error)
 }
 
-// EventPublisher is the async fan-out boundary the ledger service depends on
-// after a transaction is durably applied (e.g. fraud-check, notifications,
-// reconciliation). Implementations live in internal/kafka; tests can supply
-// an in-memory fake.
-type EventPublisher interface {
-	Publish(ctx context.Context, tx Transaction) error
-}
-
-// Service is the ledger domain service.
 type Service struct {
-	repo      Repository
-	publisher EventPublisher
+	repo Repository
 }
 
-// NewService wires a ledger Service to its Repository and EventPublisher.
-func NewService(repo Repository, publisher EventPublisher) *Service {
-	return &Service{repo: repo, publisher: publisher}
+func NewService(repo Repository) *Service {
+	return &Service{repo: repo}
 }
 
-// Post validates and applies a balanced transaction.
-func (s *Service) Post(ctx context.Context, tx Transaction) error {
-	if err := validateBalanced(tx); err != nil {
-		return err
+// Post validates, claims the idempotency key, and applies a balanced
+// transaction. Returns the HTTP status and body httpapi should send.
+func (s *Service) Post(ctx context.Context, tx Transaction) (status int, body []byte, err error) {
+	if verr := validateBalanced(tx); verr != nil {
+		return 0, nil, fmt.Errorf("%w: %v", ErrUnbalancedTransaction, verr)
 	}
 
-	seen, err := s.repo.SeenIdempotencyKey(ctx, tx.IdempotencyKey)
+	claim, err := s.repo.ClaimIdempotencyKey(ctx, tx.IdempotencyKey)
 	if err != nil {
-		return fmt.Errorf("check idempotency key: %w", err)
+		return 0, nil, fmt.Errorf("claim idempotency key: %w", err)
 	}
-	if seen {
-		return nil // already applied — safe to no-op on retry
-	}
-
-	for _, e := range tx.Entries {
-		if e.AmountCents >= 0 {
-			continue
-		}
-		balance, err := s.repo.Balance(ctx, e.AccountID)
-		if err != nil {
-			return fmt.Errorf("read balance for %s: %w", e.AccountID, err)
-		}
-		if balance+e.AmountCents < 0 {
-			return fmt.Errorf("%w: account %s", ErrInsufficientBalance, e.AccountID)
-		}
+	switch claim.State {
+	case ClaimCompleted:
+		return claim.ResponseStatus, claim.ResponseBody, nil
+	case ClaimProcessing:
+		return 0, nil, ErrConflict
 	}
 
-	if err := s.repo.Apply(ctx, tx); err != nil {
-		return fmt.Errorf("apply transaction: %w", err)
-	}
-
-	// Postgres is the source of truth and already has the transaction — a
-	// publish failure here must not fail the API response, since Kafka is
-	// an async, out-of-the-critical-path fan-out.
-	if err := s.publisher.Publish(ctx, tx); err != nil {
-		log.Printf("publish transaction event for %s: %v", tx.IdempotencyKey, err)
-	}
-	return nil
+	return s.repo.ApplyLocked(ctx, tx)
 }
 
 func validateBalanced(tx Transaction) error {
@@ -96,7 +86,7 @@ func validateBalanced(tx Transaction) error {
 		sum += e.AmountCents
 	}
 	if sum != 0 {
-		return fmt.Errorf("unbalanced transaction: entries sum to %d, want 0", sum)
+		return fmt.Errorf("entries sum to %d, want 0", sum)
 	}
 	return nil
 }
