@@ -3,89 +3,90 @@ package ledger
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 )
 
+type claimRecord struct {
+	status   string // "processing" | "completed"
+	respCode int
+	respBody []byte
+}
+
 type fakeRepo struct {
-	balances map[string]int64
-	seen     map[string]bool
-	applied  []Transaction
+	balances   map[string]int64
+	claims     map[string]*claimRecord
+	applied    []Transaction
+	outboxRows int
 }
 
 func newFakeRepo() *fakeRepo {
-	return &fakeRepo{balances: map[string]int64{}, seen: map[string]bool{}}
+	return &fakeRepo{balances: map[string]int64{}, claims: map[string]*claimRecord{}}
 }
 
-func (f *fakeRepo) Balance(_ context.Context, accountID string) (int64, error) {
-	return f.balances[accountID], nil
+func (f *fakeRepo) ClaimIdempotencyKey(_ context.Context, key string) (Claim, error) {
+	if rec, ok := f.claims[key]; ok {
+		if rec.status == "processing" {
+			return Claim{State: ClaimProcessing}, nil
+		}
+		return Claim{State: ClaimCompleted, ResponseStatus: rec.respCode, ResponseBody: rec.respBody}, nil
+	}
+	f.claims[key] = &claimRecord{status: "processing"}
+	return Claim{State: ClaimAcquired}, nil
 }
 
-func (f *fakeRepo) Apply(_ context.Context, tx Transaction) error {
+func (f *fakeRepo) ApplyLocked(_ context.Context, tx Transaction) (int, []byte, error) {
+	for _, e := range tx.Entries {
+		if e.AmountCents < 0 && f.balances[e.AccountID]+e.AmountCents < 0 {
+			body := []byte(fmt.Sprintf(`{"error":"insufficient balance: account %s"}`, e.AccountID))
+			f.claims[tx.IdempotencyKey] = &claimRecord{status: "completed", respCode: 422, respBody: body}
+			return 422, body, nil
+		}
+	}
 	for _, e := range tx.Entries {
 		f.balances[e.AccountID] += e.AmountCents
 	}
-	f.seen[tx.IdempotencyKey] = true
 	f.applied = append(f.applied, tx)
-	return nil
-}
-
-func (f *fakeRepo) SeenIdempotencyKey(_ context.Context, key string) (bool, error) {
-	return f.seen[key], nil
-}
-
-type fakePublisher struct {
-	published []Transaction
-	err       error
-}
-
-func (f *fakePublisher) Publish(_ context.Context, tx Transaction) error {
-	f.published = append(f.published, tx)
-	return f.err
+	f.outboxRows++
+	body := []byte(`{"status":"completed"}`)
+	f.claims[tx.IdempotencyKey] = &claimRecord{status: "completed", respCode: 201, respBody: body}
+	return 201, body, nil
 }
 
 func TestPost_TableDriven(t *testing.T) {
 	cases := []struct {
-		name        string
-		startBal    int64
-		tx          Transaction
-		wantErr     error
-		wantApplied bool
+		name       string
+		startBal   int64
+		tx         Transaction
+		wantStatus int
+		wantErr    error
 	}{
 		{
 			name:     "sufficient balance debits and credits",
 			startBal: 1000,
-			tx: Transaction{
-				IdempotencyKey: "tx-1",
-				Entries: []Entry{
-					{AccountID: "alice", AmountCents: -500},
-					{AccountID: "bob", AmountCents: 500},
-				},
-			},
-			wantApplied: true,
+			tx: Transaction{IdempotencyKey: "tx-1", Entries: []Entry{
+				{AccountID: "alice", AmountCents: -500},
+				{AccountID: "bob", AmountCents: 500},
+			}},
+			wantStatus: 201,
 		},
 		{
-			name:     "insufficient balance rejected",
+			name:     "insufficient balance rejected with 422, not an error",
 			startBal: 100,
-			tx: Transaction{
-				IdempotencyKey: "tx-2",
-				Entries: []Entry{
-					{AccountID: "alice", AmountCents: -500},
-					{AccountID: "bob", AmountCents: 500},
-				},
-			},
-			wantErr: ErrInsufficientBalance,
+			tx: Transaction{IdempotencyKey: "tx-2", Entries: []Entry{
+				{AccountID: "alice", AmountCents: -500},
+				{AccountID: "bob", AmountCents: 500},
+			}},
+			wantStatus: 422,
 		},
 		{
 			name:     "unbalanced transaction rejected",
 			startBal: 1000,
-			tx: Transaction{
-				IdempotencyKey: "tx-3",
-				Entries: []Entry{
-					{AccountID: "alice", AmountCents: -500},
-					{AccountID: "bob", AmountCents: 400},
-				},
-			},
-			wantErr: nil, // checked via error string below, not sentinel
+			tx: Transaction{IdempotencyKey: "tx-3", Entries: []Entry{
+				{AccountID: "alice", AmountCents: -500},
+				{AccountID: "bob", AmountCents: 400},
+			}},
+			wantErr: ErrUnbalancedTransaction,
 		},
 	}
 
@@ -93,17 +94,10 @@ func TestPost_TableDriven(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := newFakeRepo()
 			repo.balances["alice"] = tc.startBal
-			pub := &fakePublisher{}
-			svc := NewService(repo, pub)
+			svc := NewService(repo)
 
-			err := svc.Post(context.Background(), tc.tx)
+			status, _, err := svc.Post(context.Background(), tc.tx)
 
-			if tc.name == "unbalanced transaction rejected" {
-				if err == nil {
-					t.Fatal("expected error for unbalanced transaction, got nil")
-				}
-				return
-			}
 			if tc.wantErr != nil {
 				if !errors.Is(err, tc.wantErr) {
 					t.Fatalf("got err %v, want %v", err, tc.wantErr)
@@ -113,64 +107,108 @@ func TestPost_TableDriven(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if tc.wantApplied && len(repo.applied) != 1 {
-				t.Fatalf("expected transaction to be applied once, got %d", len(repo.applied))
-			}
-			if tc.wantApplied && len(pub.published) != 1 {
-				t.Fatalf("expected transaction to be published once, got %d", len(pub.published))
-			}
-			if !tc.wantApplied && len(pub.published) != 0 {
-				t.Fatalf("expected no publish for a rejected transaction, got %d", len(pub.published))
+			if status != tc.wantStatus {
+				t.Fatalf("got status %d, want %d", status, tc.wantStatus)
 			}
 		})
 	}
 }
 
-func TestPost_PublishFailureDoesNotFailPost(t *testing.T) {
+func TestPost_IdempotentRetryReplaysOriginalResponse(t *testing.T) {
 	repo := newFakeRepo()
 	repo.balances["alice"] = 1000
-	pub := &fakePublisher{err: errors.New("broker unreachable")}
-	svc := NewService(repo, pub)
-	tx := Transaction{
-		IdempotencyKey: "publish-fail-key",
-		Entries: []Entry{
-			{AccountID: "alice", AmountCents: -100},
-			{AccountID: "bob", AmountCents: 100},
-		},
-	}
+	svc := NewService(repo)
+	tx := Transaction{IdempotencyKey: "retry-key", Entries: []Entry{
+		{AccountID: "alice", AmountCents: -100},
+		{AccountID: "bob", AmountCents: 100},
+	}}
 
-	if err := svc.Post(context.Background(), tx); err != nil {
-		t.Fatalf("Post should succeed even if publish fails (Postgres is the source of truth): %v", err)
-	}
-	if len(repo.applied) != 1 {
-		t.Fatalf("expected transaction to still be applied, got %d", len(repo.applied))
-	}
-}
-
-func TestPost_IdempotentRetry(t *testing.T) {
-	repo := newFakeRepo()
-	repo.balances["alice"] = 1000
-	pub := &fakePublisher{}
-	svc := NewService(repo, pub)
-	tx := Transaction{
-		IdempotencyKey: "retry-key",
-		Entries: []Entry{
-			{AccountID: "alice", AmountCents: -100},
-			{AccountID: "bob", AmountCents: 100},
-		},
-	}
-
-	if err := svc.Post(context.Background(), tx); err != nil {
+	status1, body1, err := svc.Post(context.Background(), tx)
+	if err != nil {
 		t.Fatalf("first post: %v", err)
 	}
-	if err := svc.Post(context.Background(), tx); err != nil {
+	status2, body2, err := svc.Post(context.Background(), tx)
+	if err != nil {
 		t.Fatalf("retried post: %v", err)
 	}
 
+	if status1 != status2 || string(body1) != string(body2) {
+		t.Fatalf("replay mismatch: (%d, %s) vs (%d, %s)", status1, body1, status2, body2)
+	}
 	if got := repo.balances["alice"]; got != 900 {
 		t.Fatalf("balance double-applied: got %d, want 900", got)
 	}
-	if len(pub.published) != 1 {
-		t.Fatalf("expected publish exactly once despite the retry, got %d", len(pub.published))
+	if repo.outboxRows != 1 {
+		t.Fatalf("expected exactly one outbox row despite the retry, got %d", repo.outboxRows)
+	}
+}
+
+func TestPost_ConflictWhenKeyStillProcessing(t *testing.T) {
+	repo := newFakeRepo()
+	repo.claims["in-flight-key"] = &claimRecord{status: "processing"}
+	svc := NewService(repo)
+	tx := Transaction{IdempotencyKey: "in-flight-key", Entries: []Entry{
+		{AccountID: "alice", AmountCents: -100},
+		{AccountID: "bob", AmountCents: 100},
+	}}
+
+	_, _, err := svc.Post(context.Background(), tx)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("got err %v, want ErrConflict", err)
+	}
+	if len(repo.applied) != 0 {
+		t.Fatalf("expected no business transaction to run for a conflicting claim, got %d", len(repo.applied))
+	}
+}
+
+func TestPost_RejectedBusinessOutcomeIsNotAnError(t *testing.T) {
+	repo := newFakeRepo()
+	svc := NewService(repo)
+	tx := Transaction{IdempotencyKey: "reject-key", Entries: []Entry{
+		{AccountID: "alice", AmountCents: -500},
+		{AccountID: "bob", AmountCents: 500},
+	}}
+
+	status, body, err := svc.Post(context.Background(), tx)
+	if err != nil {
+		t.Fatalf("a business rejection must not be a Go error: %v", err)
+	}
+	if status != 422 {
+		t.Fatalf("got status %d, want 422", status)
+	}
+	if len(body) == 0 {
+		t.Fatal("expected a non-empty rejection body")
+	}
+}
+
+func TestPost_RejectedOutcomeReplaysOnRetry(t *testing.T) {
+	repo := newFakeRepo()
+	svc := NewService(repo)
+	tx := Transaction{IdempotencyKey: "reject-retry-key", Entries: []Entry{
+		{AccountID: "alice", AmountCents: -500},
+		{AccountID: "bob", AmountCents: 500},
+	}}
+
+	status1, body1, err := svc.Post(context.Background(), tx)
+	if err != nil {
+		t.Fatalf("first post: %v", err)
+	}
+	// Fund the account between attempts: a real re-run of the balance check
+	// would now succeed, but a retry of the same idempotency key must still
+	// replay the original 422 rather than re-evaluating the balance.
+	repo.balances["alice"] = 1000
+	status2, body2, err := svc.Post(context.Background(), tx)
+	if err != nil {
+		t.Fatalf("retried post: %v", err)
+	}
+
+	if status1 != 422 || status2 != 422 {
+		t.Fatalf("got statuses %d, %d, want 422, 422", status1, status2)
+	}
+	if string(body1) != string(body2) {
+		t.Fatalf("replay mismatch: %s vs %s", body1, body2)
+	}
+	if repo.balances["alice"] != 1000 {
+		t.Fatalf("retry must not touch the balance: got %d, want 1000 (unchanged by the replay)", repo.balances["alice"])
 	}
 }

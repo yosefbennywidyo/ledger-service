@@ -3,14 +3,17 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"ledger-rail/ledger-service/internal/httpapi"
 	"ledger-rail/ledger-service/internal/kafka"
 	"ledger-rail/ledger-service/internal/ledger"
+	"ledger-rail/ledger-service/internal/outbox"
 	"ledger-rail/ledger-service/internal/postgres"
 )
 
@@ -41,8 +44,13 @@ func main() {
 	producer := kafka.NewProducer(strings.Split(brokers, ","), topic)
 	defer producer.Close()
 
-	svc := ledger.NewService(store, producer)
+	svc := ledger.NewService(store)
 	server := httpapi.NewServer(svc)
+
+	relay := outbox.NewRelay(store, producer, 200*time.Millisecond, 20)
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	go relay.Run(relayCtx)
 
 	log.Printf("ledger-service listening on :%s", addr)
 	if err := http.ListenAndServe(":"+addr, server); err != nil {
