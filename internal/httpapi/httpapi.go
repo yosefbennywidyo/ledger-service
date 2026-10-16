@@ -43,7 +43,7 @@ type postTransactionRequest struct {
 func (s *Server) handlePostTransaction(w http.ResponseWriter, r *http.Request) {
 	var req postTransactionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
@@ -56,15 +56,25 @@ func (s *Server) handlePostTransaction(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, ledger.ErrUnbalancedTransaction):
-			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
 		case errors.Is(err, ledger.ErrConflict):
-			http.Error(w, err.Error(), http.StatusConflict)
+			writeJSONError(w, http.StatusConflict, err.Error())
 		default:
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, "internal error")
 		}
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	w.Write(body)
+}
+
+// writeJSONError answers a structured JSON error body instead of plain text,
+// so callers (payment-gateway, and bff after it) can always parse a
+// ledger-service error response as JSON rather than getting a null body on
+// a failed .json() parse of plain text.
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
