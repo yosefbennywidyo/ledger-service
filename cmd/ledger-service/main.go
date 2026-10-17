@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"ledger-rail/ledger-service/internal/account"
 	"ledger-rail/ledger-service/internal/httpapi"
 	"ledger-rail/ledger-service/internal/kafka"
 	"ledger-rail/ledger-service/internal/ledger"
@@ -45,7 +46,8 @@ func main() {
 	defer producer.Close()
 
 	svc := ledger.NewService(store)
-	server := httpapi.NewServer(svc)
+	accountSvc := account.NewService(store)
+	server := httpapi.NewServer(svc, accountSvc)
 
 	relay := outbox.NewRelay(store, producer, 200*time.Millisecond, 20)
 	relayCtx, cancelRelay := context.WithCancel(context.Background())
