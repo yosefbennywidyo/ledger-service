@@ -187,6 +187,34 @@ func (s *Store) ApplyLocked(ctx context.Context, tx ledger.Transaction) (status 
 	}
 	sort.Strings(accounts)
 
+	// kind/status per involved account, so the checks below can tell a
+	// system account (allowed to go negative) from a customer account, and
+	// reject any account that has been closed.
+	accountInfo := make(map[string]struct{ kind, status string }, len(accounts))
+	rows, err := dbTx.QueryContext(ctx, `SELECT id, kind, status FROM accounts WHERE id = ANY($1)`, accounts)
+	if err != nil {
+		return 0, nil, fmt.Errorf("query account kind/status: %w", err)
+	}
+	for rows.Next() {
+		var id, kind, status string
+		if err := rows.Scan(&id, &kind, &status); err != nil {
+			rows.Close()
+			return 0, nil, fmt.Errorf("scan account kind/status: %w", err)
+		}
+		accountInfo[id] = struct{ kind, status string }{kind, status}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, nil, fmt.Errorf("iterate account kind/status: %w", err)
+	}
+	rows.Close()
+
+	for _, id := range accounts {
+		if accountInfo[id].status == "closed" {
+			return rejectTransaction(ctx, dbTx, tx.IdempotencyKey, "account closed: "+id)
+		}
+	}
+
 	for _, id := range accounts {
 		if _, err := dbTx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, id); err != nil {
 			return 0, nil, fmt.Errorf("lock account %s: %w", id, err)
@@ -194,7 +222,7 @@ func (s *Store) ApplyLocked(ctx context.Context, tx ledger.Transaction) (status 
 	}
 
 	for _, id := range accounts {
-		if net[id] >= 0 {
+		if net[id] >= 0 || accountInfo[id].kind == "system" {
 			continue
 		}
 		var balance int64
@@ -205,20 +233,7 @@ func (s *Store) ApplyLocked(ctx context.Context, tx ledger.Transaction) (status 
 			return 0, nil, fmt.Errorf("query balance for %s: %w", id, err)
 		}
 		if balance+net[id] < 0 {
-			body, err := json.Marshal(map[string]string{"error": "insufficient balance: account " + id})
-			if err != nil {
-				return 0, nil, fmt.Errorf("marshal rejection: %w", err)
-			}
-			if _, err := dbTx.ExecContext(ctx,
-				`UPDATE ledger_transactions SET status = 'completed', response_status = 422, response_body = $2 WHERE idempotency_key = $1`,
-				tx.IdempotencyKey, string(body),
-			); err != nil {
-				return 0, nil, fmt.Errorf("record rejection: %w", err)
-			}
-			if err := dbTx.Commit(); err != nil {
-				return 0, nil, fmt.Errorf("commit transaction: %w", err)
-			}
-			return http.StatusUnprocessableEntity, body, nil
+			return rejectTransaction(ctx, dbTx, tx.IdempotencyKey, "insufficient balance: account "+id)
 		}
 	}
 
@@ -296,4 +311,23 @@ func (s *Store) MarkPublished(ctx context.Context, id int64) error {
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// rejectTransaction records a 422 business rejection for idempotencyKey,
+// commits dbTx, and returns the response ApplyLocked should send.
+func rejectTransaction(ctx context.Context, dbTx *sql.Tx, idempotencyKey, message string) (int, []byte, error) {
+	body, err := json.Marshal(map[string]string{"error": message})
+	if err != nil {
+		return 0, nil, fmt.Errorf("marshal rejection: %w", err)
+	}
+	if _, err := dbTx.ExecContext(ctx,
+		`UPDATE ledger_transactions SET status = 'completed', response_status = 422, response_body = $2 WHERE idempotency_key = $1`,
+		idempotencyKey, string(body),
+	); err != nil {
+		return 0, nil, fmt.Errorf("record rejection: %w", err)
+	}
+	if err := dbTx.Commit(); err != nil {
+		return 0, nil, fmt.Errorf("commit transaction: %w", err)
+	}
+	return http.StatusUnprocessableEntity, body, nil
 }
