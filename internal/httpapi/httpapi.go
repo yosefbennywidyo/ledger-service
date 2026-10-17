@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"regexp"
 	"strconv"
 
 	"ledger-rail/ledger-service/internal/account"
 	"ledger-rail/ledger-service/internal/ledger"
 )
+
+var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // Server wires HTTP routes to the ledger domain service.
 type Server struct {
@@ -102,6 +105,10 @@ func (s *Server) handlePostAccount(w http.ResponseWriter, r *http.Request) {
 	var req postAccountRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.CustomerID == "" || req.IdempotencyKey == "" {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !uuidPattern.MatchString(req.CustomerID) {
+		writeJSONError(w, http.StatusBadRequest, "customer_id must be a UUID")
 		return
 	}
 

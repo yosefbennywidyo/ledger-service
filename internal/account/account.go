@@ -73,13 +73,17 @@ type Claim struct {
 	ResponseBody   []byte
 }
 
-// Repository is the persistence boundary Service depends on.
+// Repository is the persistence boundary Service depends on. The *Claimed
+// methods run the claim-completion and the actual write in one atomic unit
+// (mirroring ledger.Repository.ApplyLocked's own claim-row-lock pattern) —
+// unlike an earlier version of this interface, a crash between "do the
+// write" and "mark the claim completed" can no longer leave an orphaned
+// customer/account behind for a reclaim to duplicate.
 type Repository interface {
 	ClaimKey(ctx context.Context, key string) (Claim, error)
-	CompleteClaim(ctx context.Context, key string, status int, body []byte) error
-	CreateCustomer(ctx context.Context, name string) (Customer, error)
-	CreateAccount(ctx context.Context, customerID string) (Account, error)
-	CloseAccount(ctx context.Context, accountID string) error
+	CreateCustomerClaimed(ctx context.Context, idempotencyKey, name string) (status int, body []byte, err error)
+	CreateAccountClaimed(ctx context.Context, idempotencyKey, customerID string) (status int, body []byte, err error)
+	CloseAccountClaimed(ctx context.Context, idempotencyKey, accountID string) (status int, body []byte, err error)
 	GetAccount(ctx context.Context, accountID string) (Account, error)
 	ListEntries(ctx context.Context, accountID string, offset, limit int) (entries []Entry, total int, err error)
 }
@@ -92,10 +96,20 @@ func NewService(repo Repository) *Service {
 	return &Service{repo: repo}
 }
 
-// withClaim runs work only when idempotencyKey isn't already claimed,
-// replaying the stored response on a completed claim and ErrConflict on an
-// in-flight one — the same orchestration ledger.Service.Post uses.
-func (s *Service) withClaim(ctx context.Context, idempotencyKey string, work func() (int, []byte, error)) (int, []byte, error) {
+func errorBody(message string) []byte {
+	b, _ := json.Marshal(map[string]string{"error": message})
+	return b
+}
+
+// claimedRequest runs run only when idempotencyKey isn't already claimed,
+// replaying the stored response on a completed claim and returning
+// ErrConflict on an in-flight one — the same phase-1 check ledger.Service.Post
+// makes before calling ApplyLocked.
+func (s *Service) claimedRequest(
+	ctx context.Context,
+	idempotencyKey string,
+	run func() (int, []byte, error),
+) (int, []byte, error) {
 	claim, err := s.repo.ClaimKey(ctx, idempotencyKey)
 	if err != nil {
 		return 0, nil, fmt.Errorf("claim idempotency key: %w", err)
@@ -106,80 +120,24 @@ func (s *Service) withClaim(ctx context.Context, idempotencyKey string, work fun
 	case ClaimProcessing:
 		return 0, nil, ErrConflict
 	}
-
-	status, body, err := work()
-	if err != nil {
-		return 0, nil, err
-	}
-	if err := s.repo.CompleteClaim(ctx, idempotencyKey, status, body); err != nil {
-		return 0, nil, fmt.Errorf("complete idempotency claim: %w", err)
-	}
-	return status, body, nil
-}
-
-func errorBody(message string) []byte {
-	b, _ := json.Marshal(map[string]string{"error": message})
-	return b
+	return run()
 }
 
 func (s *Service) CreateCustomer(ctx context.Context, name, idempotencyKey string) (int, []byte, error) {
-	return s.withClaim(ctx, idempotencyKey, func() (int, []byte, error) {
-		customer, err := s.repo.CreateCustomer(ctx, name)
-		if err != nil {
-			return 0, nil, fmt.Errorf("create customer: %w", err)
-		}
-		body, err := json.Marshal(map[string]any{
-			"id":         customer.ID,
-			"name":       customer.Name,
-			"created_at": customer.CreatedAt,
-		})
-		if err != nil {
-			return 0, nil, fmt.Errorf("marshal customer: %w", err)
-		}
-		return 201, body, nil
+	return s.claimedRequest(ctx, idempotencyKey, func() (int, []byte, error) {
+		return s.repo.CreateCustomerClaimed(ctx, idempotencyKey, name)
 	})
 }
 
 func (s *Service) CreateAccount(ctx context.Context, customerID, idempotencyKey string) (int, []byte, error) {
-	return s.withClaim(ctx, idempotencyKey, func() (int, []byte, error) {
-		acc, err := s.repo.CreateAccount(ctx, customerID)
-		if errors.Is(err, ErrCustomerNotFound) {
-			return 404, errorBody("customer not found"), nil
-		}
-		if err != nil {
-			return 0, nil, fmt.Errorf("create account: %w", err)
-		}
-		body, err := json.Marshal(map[string]any{
-			"id":          acc.ID,
-			"customer_id": acc.CustomerID,
-			"kind":        acc.Kind,
-			"status":      acc.Status,
-			"created_at":  acc.CreatedAt,
-		})
-		if err != nil {
-			return 0, nil, fmt.Errorf("marshal account: %w", err)
-		}
-		return 201, body, nil
+	return s.claimedRequest(ctx, idempotencyKey, func() (int, []byte, error) {
+		return s.repo.CreateAccountClaimed(ctx, idempotencyKey, customerID)
 	})
 }
 
 func (s *Service) CloseAccount(ctx context.Context, accountID, idempotencyKey string) (int, []byte, error) {
-	return s.withClaim(ctx, idempotencyKey, func() (int, []byte, error) {
-		err := s.repo.CloseAccount(ctx, accountID)
-		if errors.Is(err, ErrAccountNotFound) {
-			return 404, errorBody("account not found"), nil
-		}
-		if err != nil {
-			return 0, nil, fmt.Errorf("close account: %w", err)
-		}
-		body, err := json.Marshal(map[string]any{
-			"id":     accountID,
-			"status": StatusClosed,
-		})
-		if err != nil {
-			return 0, nil, fmt.Errorf("marshal close response: %w", err)
-		}
-		return 200, body, nil
+	return s.claimedRequest(ctx, idempotencyKey, func() (int, []byte, error) {
+		return s.repo.CloseAccountClaimed(ctx, idempotencyKey, accountID)
 	})
 }
 

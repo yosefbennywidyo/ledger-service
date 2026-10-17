@@ -43,36 +43,54 @@ func (f *fakeRepo) ClaimKey(_ context.Context, key string) (Claim, error) {
 	return Claim{State: ClaimAcquired}, nil
 }
 
-func (f *fakeRepo) CompleteClaim(_ context.Context, key string, status int, body []byte) error {
+// complete records status/body as f's real postgres counterpart would in the
+// same transaction as the write — the fake has no concept of a crash between
+// the two, so it can't exercise the atomicity fix directly, only the
+// observable behavior (business rejections still complete the claim; the new
+// 422s).
+func (f *fakeRepo) complete(key string, status int, body []byte) (int, []byte, error) {
 	f.claims[key] = &claimRecord{status: "completed", respCode: status, respBody: body}
-	return nil
+	return status, body, nil
 }
 
-func (f *fakeRepo) CreateCustomer(_ context.Context, name string) (Customer, error) {
+func (f *fakeRepo) CreateCustomerClaimed(_ context.Context, idempotencyKey, name string) (int, []byte, error) {
 	f.nextCustomerID++
 	c := Customer{ID: fmt.Sprintf("cust-%d", f.nextCustomerID), Name: name}
 	f.customers[c.ID] = c
-	return c, nil
+	body, _ := json.Marshal(map[string]any{"id": c.ID, "name": c.Name, "created_at": c.CreatedAt})
+	return f.complete(idempotencyKey, 201, body)
 }
 
-func (f *fakeRepo) CreateAccount(_ context.Context, customerID string) (Account, error) {
+func (f *fakeRepo) CreateAccountClaimed(_ context.Context, idempotencyKey, customerID string) (int, []byte, error) {
 	if _, ok := f.customers[customerID]; !ok {
-		return Account{}, ErrCustomerNotFound
+		return f.complete(idempotencyKey, 404, []byte(`{"error":"customer not found"}`))
 	}
 	f.nextAccountID++
 	a := Account{ID: fmt.Sprintf("acc-%d", f.nextAccountID), CustomerID: customerID, Kind: KindCustomer, Status: StatusActive}
 	f.accounts[a.ID] = a
-	return a, nil
+	body, _ := json.Marshal(map[string]any{"id": a.ID, "customer_id": a.CustomerID, "kind": a.Kind, "status": a.Status})
+	return f.complete(idempotencyKey, 201, body)
 }
 
-func (f *fakeRepo) CloseAccount(_ context.Context, accountID string) error {
+func (f *fakeRepo) CloseAccountClaimed(_ context.Context, idempotencyKey, accountID string) (int, []byte, error) {
 	a, ok := f.accounts[accountID]
 	if !ok {
-		return ErrAccountNotFound
+		return f.complete(idempotencyKey, 404, []byte(`{"error":"account not found"}`))
+	}
+	if a.Kind == KindSystem {
+		return f.complete(idempotencyKey, 422, []byte(`{"error":"system account cannot be closed"}`))
+	}
+	var balance int64
+	for _, e := range f.entries[accountID] {
+		balance += e.AmountCents
+	}
+	if balance != 0 {
+		return f.complete(idempotencyKey, 422, []byte(`{"error":"account has a non-zero balance"}`))
 	}
 	a.Status = StatusClosed
 	f.accounts[accountID] = a
-	return nil
+	body, _ := json.Marshal(map[string]any{"id": accountID, "status": "closed"})
+	return f.complete(idempotencyKey, 200, body)
 }
 
 func (f *fakeRepo) GetAccount(_ context.Context, accountID string) (Account, error) {
@@ -308,5 +326,46 @@ func TestCreateAccount_ConflictWhenKeyStillProcessing(t *testing.T) {
 	_, _, err := svc.CreateAccount(context.Background(), "cust-1", "in-flight-key")
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("got err %v, want ErrConflict", err)
+	}
+}
+
+func TestCloseAccount_SystemAccountRejected(t *testing.T) {
+	repo := newFakeRepo()
+	repo.accounts["system:cash"] = Account{ID: "system:cash", Kind: KindSystem, Status: StatusActive}
+	svc := NewService(repo)
+
+	status, body, err := svc.CloseAccount(context.Background(), "system:cash", "key-1")
+	if err != nil {
+		t.Fatalf("a business rejection must not be a Go error: %v", err)
+	}
+	if status != 422 {
+		t.Fatalf("got status %d, want 422", status)
+	}
+	if string(body) != `{"error":"system account cannot be closed"}` {
+		t.Fatalf("got body %s", body)
+	}
+	if repo.accounts["system:cash"].Status != StatusActive {
+		t.Fatal("system:cash must remain active")
+	}
+}
+
+func TestCloseAccount_NonZeroBalanceRejected(t *testing.T) {
+	repo := newFakeRepo()
+	repo.accounts["acc-1"] = Account{ID: "acc-1", Kind: KindCustomer, Status: StatusActive}
+	repo.entries["acc-1"] = []Entry{{AccountID: "acc-1", AmountCents: 500}}
+	svc := NewService(repo)
+
+	status, body, err := svc.CloseAccount(context.Background(), "acc-1", "key-1")
+	if err != nil {
+		t.Fatalf("a business rejection must not be a Go error: %v", err)
+	}
+	if status != 422 {
+		t.Fatalf("got status %d, want 422", status)
+	}
+	if string(body) != `{"error":"account has a non-zero balance"}` {
+		t.Fatalf("got body %s", body)
+	}
+	if repo.accounts["acc-1"].Status != StatusActive {
+		t.Fatal("acc-1 must remain active")
 	}
 }
