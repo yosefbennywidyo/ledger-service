@@ -14,13 +14,15 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 
+	"ledger-rail/ledger-service/internal/account"
 	"ledger-rail/ledger-service/internal/ledger"
 	"ledger-rail/ledger-service/internal/outbox"
 )
 
 var (
-	_ ledger.Repository = (*Store)(nil)
-	_ outbox.Repository = (*Store)(nil)
+	_ ledger.Repository  = (*Store)(nil)
+	_ account.Repository = (*Store)(nil)
+	_ outbox.Repository  = (*Store)(nil)
 )
 
 // processingTimeout is how long an idempotency key may sit in 'processing'
