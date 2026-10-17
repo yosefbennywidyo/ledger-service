@@ -210,6 +210,12 @@ func (s *Store) ApplyLocked(ctx context.Context, tx ledger.Transaction) (status 
 	rows.Close()
 
 	for _, id := range accounts {
+		if _, ok := accountInfo[id]; !ok {
+			return rejectTransaction(ctx, dbTx, tx.IdempotencyKey, "account not found: "+id)
+		}
+	}
+
+	for _, id := range accounts {
 		if accountInfo[id].status == "closed" {
 			return rejectTransaction(ctx, dbTx, tx.IdempotencyKey, "account closed: "+id)
 		}
